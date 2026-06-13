@@ -1,0 +1,1117 @@
+---
+title: "Análisis y modelado del riesgo de impago en tarjetas de crédito"
+author: "Gabriel Costa Riesco"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    highlight: default
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    code_folding: show
+    self_contained: yes
+  word_document:
+    toc: yes
+---
+
+<style>
+.project-header {
+  max-width: 910px;
+  margin: 0 auto 28px auto;
+  padding: 22px 26px;
+  color: #263238;
+  border-top: 8px solid #73EDFF;
+  border-bottom: 8px solid #FCB517;
+  background: #f7f9fa;
+}
+.project-header h2 {
+  margin: 0 0 8px 0;
+  font-size: 30px;
+}
+.project-header p {
+  margin: 0;
+  font-size: 16px;
+}
+blockquote {
+  border-left: 4px solid #73EDFF;
+  background: #f7f9fa;
+  padding: 10px 16px;
+}
+</style>
+
+<div class="project-header">
+  <h2>Proyecto de minería de datos</h2>
+  <p>Segmentación de clientes y predicción del riesgo de impago</p>
+  <p><strong>Gabriel Costa Riesco</strong></p>
+</div>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5.5,
+  cache = FALSE
+)
+
+options(scipen = 999)
+
+required_packages <- c(
+  "readxl", "dplyr", "tidyr", "ggplot2", "factoextra", "corrplot",
+  "cluster", "dbscan", "caret", "rpart", "rpart.plot",
+  "randomForest", "amap"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+set.seed(123)
+```
+
+# Resumen ejecutivo
+
+El objetivo de este proyecto es estudiar el riesgo de impago de clientes con
+tarjeta de crédito. El análisis combina dos líneas de trabajo:
+
+1. **Segmentación no supervisada**, para identificar perfiles de clientes a
+   partir de su deuda mensual y de los pagos realizados.
+2. **Clasificación supervisada**, para estimar si un cliente incurrirá en
+   impago durante el siguiente periodo.
+
+El proyecto cubre el proceso completo: comprensión del problema, preparación
+del dataset, análisis exploratorio, reducción de dimensionalidad, clustering,
+entrenamiento de modelos predictivos y evaluación de resultados.
+
+# Contexto y objetivos
+
+El impago de una tarjeta de crédito genera pérdidas directas, aumenta los
+costes de recobro y complica la asignación de nuevos límites de crédito. La
+finalidad del análisis es aportar una base cuantitativa para:
+
+- detectar grupos de clientes con comportamientos financieros similares;
+- estudiar la relación entre deuda, pagos, retrasos y características
+  demográficas;
+- construir un modelo que ayude a identificar clientes con mayor riesgo;
+- explicar las limitaciones que deben tenerse en cuenta antes de utilizar el
+  modelo en un entorno real.
+
+La variable objetivo es `Pago`. En la fuente original toma el valor `1` cuando
+se produce un impago en el mes siguiente y `0` cuando no se produce.
+
+# Metodología
+
+La estructura del proyecto sigue **CRISP-DM**:
+
+1. **Comprensión del negocio**: reducir la incertidumbre asociada a la
+   concesión y gestión del crédito.
+2. **Comprensión de los datos**: revisar variables, distribuciones, valores
+   ausentes y categorías no documentadas.
+3. **Preparación**: limpiar categorías, transformar tipos y renombrar
+   variables para facilitar su interpretación.
+4. **Modelado**: aplicar PCA, k-means, k-medians, PAM, una variante con
+   distancia Manhattan, DBSCAN, OPTICS, árboles de decisión y Random Forest.
+5. **Evaluación**: comparar cohesión de clústeres y métricas de clasificación.
+6. **Aplicación**: traducir los resultados a perfiles de riesgo, manteniendo
+   siempre supervisión humana.
+
+# Fuente de datos
+
+Se utiliza el dataset
+[Default of Credit Card Clients](https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients),
+publicado en el UCI Machine Learning Repository.
+
+El conjunto contiene 30.000 clientes de una entidad financiera de Taiwán y 25
+variables relacionadas con:
+
+- límite de crédito;
+- sexo, educación, estado civil y edad;
+- retrasos mensuales;
+- deuda facturada durante seis meses;
+- pagos realizados durante seis meses;
+- impago en el siguiente periodo.
+
+El dataset permite aplicar técnicas supervisadas y no supervisadas. Su tamaño
+es suficiente para separar entrenamiento y test, aunque su antigüedad y su
+contexto geográfico limitan la generalización de las conclusiones.
+
+# Carga y preparación
+
+## Lectura de los datos
+
+```{r carga-datos}
+data_path <- file.path("data", "creditcard.xls")
+
+if (!file.exists(data_path)) {
+  stop("No se encuentra el archivo data/creditcard.xls")
+}
+
+clientes_raw <- readxl::read_excel(
+  data_path,
+  skip = 1,
+  col_names = TRUE
+)
+
+dim(clientes_raw)
+head(clientes_raw)
+```
+
+El archivo original contiene 30.000 observaciones y 25 columnas. La primera
+revisión permite comprobar los nombres, tipos y rangos disponibles.
+
+```{r estructura-inicial}
+str(clientes_raw)
+summary(clientes_raw)
+colSums(is.na(clientes_raw))
+```
+
+## Limpieza de categorías
+
+La documentación define cuatro categorías de educación y tres de estado
+civil. Los códigos fuera de esos rangos no tienen una interpretación clara,
+por lo que se eliminan antes del modelado.
+
+```{r limpieza-categorias}
+clientes <- clientes_raw |>
+  dplyr::filter(
+    EDUCATION %in% c(1, 2, 3, 4),
+    MARRIAGE %in% c(1, 2, 3)
+  )
+
+filas_eliminadas <- nrow(clientes_raw) - nrow(clientes)
+porcentaje_eliminado <- 100 * filas_eliminadas / nrow(clientes_raw)
+
+data.frame(
+  filas_originales = nrow(clientes_raw),
+  filas_finales = nrow(clientes),
+  filas_eliminadas = filas_eliminadas,
+  porcentaje_eliminado = round(porcentaje_eliminado, 3)
+)
+```
+
+La pérdida de observaciones es muy reducida y mejora la interpretabilidad de
+las variables categóricas.
+
+## Transformación y nombres descriptivos
+
+```{r transformar-variables}
+rename_map <- c(
+  "default payment next month" = "Pago",
+  "PAY_0" = "RETRASOS_Septiembre",
+  "PAY_2" = "RETRASOS_Agosto",
+  "PAY_3" = "RETRASOS_Julio",
+  "PAY_4" = "RETRASOS_Junio",
+  "PAY_5" = "RETRASOS_Mayo",
+  "PAY_6" = "RETRASOS_Abril",
+  "BILL_AMT1" = "DEUDA_Septiembre",
+  "BILL_AMT2" = "DEUDA_Agosto",
+  "BILL_AMT3" = "DEUDA_Julio",
+  "BILL_AMT4" = "DEUDA_Junio",
+  "BILL_AMT5" = "DEUDA_Mayo",
+  "BILL_AMT6" = "DEUDA_Abril",
+  "PAY_AMT1" = "PAGADO_Septiembre",
+  "PAY_AMT2" = "PAGADO_Agosto",
+  "PAY_AMT3" = "PAGADO_Julio",
+  "PAY_AMT4" = "PAGADO_Junio",
+  "PAY_AMT5" = "PAGADO_Mayo",
+  "PAY_AMT6" = "PAGADO_Abril"
+)
+
+for (old_name in names(rename_map)) {
+  names(clientes)[names(clientes) == old_name] <- rename_map[[old_name]]
+}
+
+clientes <- clientes |>
+  dplyr::mutate(
+    SEX = factor(SEX, levels = c(1, 2), labels = c("Hombre", "Mujer")),
+    EDUCATION = factor(
+      EDUCATION,
+      levels = c(1, 2, 3, 4),
+      labels = c(
+        "Posgrado", "Universidad",
+        "Graduado escolar", "Otro"
+      )
+    ),
+    MARRIAGE = factor(
+      MARRIAGE,
+      levels = c(1, 2, 3),
+      labels = c("Casado", "Soltero", "Otro")
+    ),
+    Pago = factor(
+      Pago,
+      levels = c(0, 1),
+      labels = c("No impago", "Impago")
+    ),
+    GEdad = cut(
+      AGE,
+      breaks = c(-Inf, 30, 45, 60, Inf),
+      labels = c("Joven", "Adulto joven", "Adulto", "Mayor")
+    )
+  )
+
+head(clientes)
+```
+
+## Diccionario resumido
+
+| Grupo | Variables | Interpretación |
+|:---|:---|:---|
+| Identificación | `ID` | Identificador único del cliente |
+| Crédito | `LIMIT_BAL` | Límite concedido en dólares taiwaneses |
+| Perfil | `SEX`, `EDUCATION`, `MARRIAGE`, `AGE`, `GEdad` | Características demográficas |
+| Retrasos | `RETRASOS_*` | Estado de pago durante seis meses |
+| Deuda | `DEUDA_*` | Importe facturado durante seis meses |
+| Pagos | `PAGADO_*` | Importe pagado durante seis meses |
+| Objetivo | `Pago` | Impago o no impago en el periodo siguiente |
+
+```{r control-calidad}
+data.frame(
+  variable = names(clientes),
+  tipo = vapply(clientes, function(x) class(x)[1], character(1)),
+  ausentes = vapply(clientes, function(x) sum(is.na(x)), numeric(1))
+)
+```
+
+# Análisis exploratorio
+
+## Distribución de la variable objetivo
+
+```{r distribucion-objetivo}
+prop.table(table(clientes$Pago))
+
+ggplot(clientes, aes(x = Pago, fill = Pago)) +
+  geom_bar() +
+  scale_fill_manual(values = c("No impago" = "skyblue", "Impago" = "salmon")) +
+  labs(
+    title = "Distribución de la variable objetivo",
+    x = NULL,
+    y = "Número de clientes"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+La clase `No impago` es mayoritaria. Este desequilibrio debe considerarse al
+interpretar la accuracy: un modelo que siempre predijera la clase mayoritaria
+podría obtener un porcentaje aparentemente alto sin detectar correctamente los
+impagos.
+
+## Perfil demográfico
+
+```{r perfil-demografico, fig.height=8}
+p_edad <- ggplot(clientes, aes(x = GEdad, fill = Pago)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("No impago" = "skyblue", "Impago" = "salmon")) +
+  labs(
+    title = "Proporción de impago por grupo de edad",
+    x = "Grupo de edad",
+    y = "Proporción",
+    fill = "Resultado"
+  ) +
+  theme_minimal()
+
+p_educacion <- ggplot(clientes, aes(x = EDUCATION, fill = Pago)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("No impago" = "skyblue", "Impago" = "salmon")) +
+  labs(
+    title = "Proporción de impago por educación",
+    x = "Educación",
+    y = "Proporción",
+    fill = "Resultado"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_edad
+p_educacion
+```
+
+Las variables demográficas muestran diferencias, pero no ofrecen por sí solas
+una separación fuerte entre clientes con y sin impago. Será necesario
+incorporar el historial financiero.
+
+```{r asociaciones-categoricas}
+prop.table(table(clientes$SEX, clientes$Pago), 1)
+prop.table(table(clientes$EDUCATION, clientes$Pago), 1)
+prop.table(table(clientes$MARRIAGE, clientes$Pago), 1)
+prop.table(table(clientes$GEdad, clientes$Pago), 1)
+```
+
+## Crédito, deuda y pagos
+
+```{r distribuciones-financieras, fig.height=8}
+par(mfrow = c(2, 2))
+boxplot(clientes$LIMIT_BAL, main = "Límite de crédito", ylab = "NT$")
+boxplot(clientes$AGE, main = "Edad", ylab = "Años")
+boxplot(
+  clientes[, grep("^DEUDA_", names(clientes))],
+  main = "Deuda facturada por mes",
+  las = 2
+)
+boxplot(
+  clientes[, grep("^PAGADO_", names(clientes))],
+  main = "Pagos realizados por mes",
+  las = 2
+)
+par(mfrow = c(1, 1))
+```
+
+Los importes presentan una dispersión elevada. En este contexto los valores
+extremos no son necesariamente errores: clientes con límites y deudas muy
+distintos forman parte de la naturaleza del problema. Para evitar que las
+variables con mayor escala dominen los algoritmos basados en distancia, se
+trabajará también con datos estandarizados.
+
+```{r evolucion-deuda-pagos, fig.height=8}
+orden_meses <- c("Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre")
+
+deuda_larga <- clientes |>
+  dplyr::select(Pago, dplyr::starts_with("DEUDA_")) |>
+  tidyr::pivot_longer(
+    cols = -Pago,
+    names_to = "Mes",
+    values_to = "Importe"
+  ) |>
+  dplyr::mutate(
+    Mes = factor(
+      sub("DEUDA_", "", Mes),
+      levels = orden_meses
+    )
+  )
+
+pagos_largos <- clientes |>
+  dplyr::select(Pago, dplyr::starts_with("PAGADO_")) |>
+  tidyr::pivot_longer(
+    cols = -Pago,
+    names_to = "Mes",
+    values_to = "Importe"
+  ) |>
+  dplyr::mutate(
+    Mes = factor(
+      sub("PAGADO_", "", Mes),
+      levels = orden_meses
+    )
+  )
+
+ggplot(deuda_larga, aes(x = Mes, y = Importe, color = Pago, group = Pago)) +
+  stat_summary(fun = median, geom = "line", linewidth = 1) +
+  stat_summary(fun = median, geom = "point", size = 2.5) +
+  scale_color_manual(values = c("No impago" = "skyblue3", "Impago" = "salmon3")) +
+  labs(
+    title = "Evolución de la deuda mediana",
+    x = "Mes",
+    y = "Deuda mediana",
+    color = "Resultado"
+  ) +
+  theme_minimal()
+
+ggplot(pagos_largos, aes(x = Mes, y = Importe, color = Pago, group = Pago)) +
+  stat_summary(fun = median, geom = "line", linewidth = 1) +
+  stat_summary(fun = median, geom = "point", size = 2.5) +
+  scale_color_manual(values = c("No impago" = "skyblue3", "Impago" = "salmon3")) +
+  labs(
+    title = "Evolución del pago mediano",
+    x = "Mes",
+    y = "Pago mediano",
+    color = "Resultado"
+  ) +
+  theme_minimal()
+```
+
+## Correlaciones
+
+```{r correlaciones, fig.height=8}
+variables_numericas <- clientes |>
+  dplyr::select(
+    LIMIT_BAL, AGE,
+    dplyr::starts_with("RETRASOS_"),
+    dplyr::starts_with("DEUDA_"),
+    dplyr::starts_with("PAGADO_")
+  )
+
+matriz_cor <- cor(variables_numericas)
+
+corrplot::corrplot(
+  matriz_cor,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.65,
+  tl.col = "black"
+)
+```
+
+Los importes de deuda de meses consecutivos están muy correlacionados. También
+existe relación entre los estados de retraso. Esta redundancia justifica
+aplicar PCA como herramienta de síntesis.
+
+# Reducción de dimensionalidad con PCA
+
+El PCA se aplica a las doce variables continuas de deuda y pagos. Se
+estandarizan previamente para que todas contribuyan en una escala comparable.
+
+```{r pca}
+variables_cluster <- clientes |>
+  dplyr::select(
+    dplyr::starts_with("DEUDA_"),
+    dplyr::starts_with("PAGADO_")
+  )
+
+variables_cluster_scaled <- scale(variables_cluster)
+
+pca_result <- prcomp(
+  variables_cluster_scaled,
+  center = FALSE,
+  scale. = FALSE
+)
+
+varianza <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+resumen_pca <- data.frame(
+  componente = paste0("PC", seq_along(varianza)),
+  varianza = round(100 * varianza, 2),
+  varianza_acumulada = round(100 * cumsum(varianza), 2)
+)
+
+knitr::kable(resumen_pca)
+```
+
+```{r graficos-pca, fig.height=7}
+factoextra::fviz_eig(
+  pca_result,
+  addlabels = TRUE,
+  ylim = c(0, 55)
+)
+
+factoextra::fviz_pca_var(
+  pca_result,
+  col.var = "contrib",
+  gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+  repel = TRUE
+)
+```
+
+```{r componentes-pca}
+n_componentes_90 <- which(cumsum(varianza) >= 0.90)[1]
+n_componentes_90
+
+componentes_financieros <- as.data.frame(
+  pca_result$x[, seq_len(n_componentes_90), drop = FALSE]
+)
+
+names(componentes_financieros) <- paste0(
+  "PCA_FINANCIERO_",
+  seq_len(n_componentes_90)
+)
+
+clientes_pca <- dplyr::bind_cols(clientes, componentes_financieros)
+head(componentes_financieros)
+```
+
+Las primeras componentes resumen la evolución conjunta de deuda y pagos. El
+número conservado se determina de forma reproducible mediante el umbral del
+90% de varianza acumulada.
+
+# Segmentación no supervisada
+
+Los algoritmos basados en distancias se ejecutan sobre una muestra reproducible
+de 5.000 clientes. Esta decisión mantiene un coste computacional razonable,
+especialmente en los métodos que necesitan calcular matrices de distancia.
+
+```{r muestra-clustering}
+set.seed(123)
+idx_cluster <- sample(
+  seq_len(nrow(variables_cluster)),
+  min(nrow(variables_cluster), 5000)
+)
+
+cluster_sample <- as.data.frame(variables_cluster[idx_cluster, ])
+cluster_sample_scaled <- scale(cluster_sample)
+```
+
+## Selección del número de clústeres
+
+```{r numero-cluster, fig.height=6}
+factoextra::fviz_nbclust(
+  cluster_sample_scaled,
+  kmeans,
+  method = "wss",
+  k.max = 8,
+  nstart = 25
+) +
+  labs(subtitle = "Método del codo")
+
+factoextra::fviz_nbclust(
+  cluster_sample_scaled,
+  kmeans,
+  method = "silhouette",
+  k.max = 8,
+  nstart = 25
+) +
+  labs(subtitle = "Método de la silueta")
+```
+
+El método del codo, la silueta y la interpretabilidad se consideran de forma
+conjunta. Se mantiene `k = 3`, ya que permite separar perfiles de deuda baja,
+intermedia y elevada sin introducir una fragmentación difícil de explicar.
+
+## K-means con datos originales y normalizados
+
+```{r kmeans}
+set.seed(123)
+km_original <- kmeans(
+  cluster_sample,
+  centers = 3,
+  nstart = 25
+)
+
+set.seed(123)
+km_scaled <- kmeans(
+  cluster_sample_scaled,
+  centers = 3,
+  nstart = 25
+)
+
+knitr::kable(
+  round(km_original$centers, 2),
+  caption = "Centroides con datos originales"
+)
+
+knitr::kable(
+  round(km_scaled$centers, 2),
+  caption = "Centroides con datos estandarizados"
+)
+```
+
+```{r visualizar-kmeans}
+factoextra::fviz_cluster(
+  km_scaled,
+  data = cluster_sample_scaled,
+  geom = "point",
+  ellipse.type = "convex",
+  ggtheme = theme_minimal(),
+  main = "Segmentación k-means con datos estandarizados"
+)
+```
+
+La versión sin normalizar queda dominada por los importes de mayor magnitud.
+La versión estandarizada ofrece perfiles más equilibrados y será la referencia
+para las comparaciones posteriores.
+
+## K-medians y PAM
+
+K-medians utiliza la mediana como centro y distancia Manhattan. No debe
+confundirse con PAM, que utiliza observaciones reales como medoides. Para
+comparar correctamente ambos enfoques se implementan por separado.
+
+```{r funcion-kmedians}
+kmedians <- function(x, centers, nstart = 5, iter.max = 100, tol = 1e-6) {
+  x <- as.matrix(x)
+  best_model <- NULL
+
+  for (start in seq_len(nstart)) {
+    center_matrix <- x[sample(seq_len(nrow(x)), centers), , drop = FALSE]
+
+    for (iteration in seq_len(iter.max)) {
+      distances <- sapply(
+        seq_len(centers),
+        function(j) rowSums(abs(sweep(x, 2, center_matrix[j, ], "-")))
+      )
+
+      cluster <- max.col(-distances, ties.method = "random")
+
+      new_centers <- do.call(
+        rbind,
+        lapply(seq_len(centers), function(j) {
+          if (sum(cluster == j) == 0) {
+            x[sample(seq_len(nrow(x)), 1), ]
+          } else {
+            apply(x[cluster == j, , drop = FALSE], 2, median)
+          }
+        })
+      )
+
+      if (max(abs(new_centers - center_matrix)) < tol) {
+        center_matrix <- new_centers
+        break
+      }
+
+      center_matrix <- new_centers
+    }
+
+    objective <- sum(abs(x - center_matrix[cluster, , drop = FALSE]))
+
+    if (is.null(best_model) || objective < best_model$objective) {
+      best_model <- list(
+        cluster = cluster,
+        centers = center_matrix,
+        objective = objective,
+        iterations = iteration
+      )
+    }
+  }
+
+  best_model
+}
+```
+
+```{r ajustar-kmedians-pam}
+set.seed(123)
+kmed_model <- kmedians(
+  cluster_sample_scaled,
+  centers = 3,
+  nstart = 5
+)
+
+set.seed(123)
+pam_model <- cluster::pam(
+  cluster_sample_scaled,
+  k = 3,
+  metric = "manhattan"
+)
+
+table(kmedians = kmed_model$cluster)
+table(PAM = pam_model$clustering)
+
+knitr::kable(
+  round(kmed_model$centers, 2),
+  caption = "Centros obtenidos con k-medians"
+)
+```
+
+```{r comparacion-cluster}
+adjusted_rand_index <- function(x, y) {
+  tab <- table(x, y)
+  choose_two <- function(z) z * (z - 1) / 2
+  n <- sum(tab)
+  observed <- sum(choose_two(tab))
+  rows <- sum(choose_two(rowSums(tab)))
+  cols <- sum(choose_two(colSums(tab)))
+  total <- choose_two(n)
+  expected <- rows * cols / total
+  maximum <- (rows + cols) / 2
+  (observed - expected) / (maximum - expected)
+}
+
+set.seed(123)
+sil_idx <- sample(
+  seq_len(nrow(cluster_sample_scaled)),
+  min(1500, nrow(cluster_sample_scaled))
+)
+
+dist_sil <- dist(cluster_sample_scaled[sil_idx, ])
+
+calidad_cluster <- data.frame(
+  modelo = c("K-means", "K-medians", "PAM"),
+  silueta_media = c(
+    mean(cluster::silhouette(km_scaled$cluster[sil_idx], dist_sil)[, 3]),
+    mean(cluster::silhouette(kmed_model$cluster[sil_idx], dist_sil)[, 3]),
+    mean(cluster::silhouette(pam_model$clustering[sil_idx], dist_sil)[, 3])
+  ),
+  concordancia_con_kmeans = c(
+    1,
+    adjusted_rand_index(km_scaled$cluster, kmed_model$cluster),
+    adjusted_rand_index(km_scaled$cluster, pam_model$clustering)
+  )
+)
+
+knitr::kable(
+  transform(
+    calidad_cluster,
+    silueta_media = round(silueta_media, 3),
+    concordancia_con_kmeans = round(concordancia_con_kmeans, 3)
+  )
+)
+```
+
+K-medians y PAM reducen la influencia de importes extremos. La tabla permite
+comparar la cohesión interna y la concordancia con la solución de k-means sin
+depender del número asignado a cada clúster.
+
+## Agrupación con distancia Manhattan
+
+```{r manhattan}
+set.seed(123)
+km_manhattan <- amap::Kmeans(
+  cluster_sample_scaled,
+  centers = 3,
+  method = "manhattan",
+  iter.max = 100
+)
+
+table(
+  Kmeans_Euclidea = km_scaled$cluster,
+  Kmeans_Manhattan = km_manhattan$cluster
+)
+
+adjusted_rand_index(km_scaled$cluster, km_manhattan$cluster)
+```
+
+La distancia Manhattan es menos sensible a diferencias extremas en una sola
+variable. La comparación permite comprobar si los perfiles se mantienen al
+cambiar la geometría utilizada por el algoritmo.
+
+## DBSCAN y OPTICS
+
+Los métodos basados en densidad se prueban con distintos valores de `eps`.
+Para reducir el coste de la matriz de distancias se utiliza una muestra de
+3.000 observaciones.
+
+```{r preparar-densidad}
+set.seed(123)
+idx_density <- sample(
+  seq_len(nrow(cluster_sample_scaled)),
+  min(3000, nrow(cluster_sample_scaled))
+)
+
+density_sample <- cluster_sample_scaled[idx_density, ]
+min_pts <- 2 * ncol(density_sample)
+kdist <- dbscan::kNNdist(density_sample, k = min_pts)
+eps_candidates <- as.numeric(quantile(kdist, c(0.75, 0.85, 0.95)))
+
+plot(
+  sort(kdist),
+  type = "l",
+  main = "Distancia al vecino k para seleccionar eps",
+  xlab = "Observaciones ordenadas",
+  ylab = paste0("Distancia al vecino ", min_pts)
+)
+abline(h = eps_candidates, col = c("steelblue", "orange", "red"), lty = 2)
+```
+
+```{r dbscan}
+dbscan_models <- lapply(
+  eps_candidates,
+  function(eps_value) {
+    dbscan::dbscan(
+      density_sample,
+      eps = eps_value,
+      minPts = min_pts
+    )
+  }
+)
+
+dbscan_summary <- data.frame(
+  eps = round(eps_candidates, 3),
+  clusters = vapply(
+    dbscan_models,
+    function(model) length(setdiff(unique(model$cluster), 0)),
+    numeric(1)
+  ),
+  porcentaje_ruido = round(
+    100 * vapply(
+      dbscan_models,
+      function(model) mean(model$cluster == 0),
+      numeric(1)
+    ),
+    2
+  )
+)
+
+knitr::kable(dbscan_summary)
+```
+
+```{r optics}
+optics_model <- dbscan::optics(
+  density_sample,
+  minPts = min_pts
+)
+
+plot(optics_model, main = "Reachability plot de OPTICS")
+
+optics_clusters <- dbscan::extractDBSCAN(
+  optics_model,
+  eps_cl = eps_candidates[2]
+)
+
+table(optics_clusters$cluster)
+```
+
+```{r visualizar-densidad}
+pca_density <- prcomp(density_sample)$x[, 1:2] |>
+  as.data.frame()
+
+pca_density$DBSCAN <- factor(dbscan_models[[2]]$cluster)
+pca_density$OPTICS <- factor(optics_clusters$cluster)
+
+ggplot(pca_density, aes(x = PC1, y = PC2, color = DBSCAN)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(title = "DBSCAN proyectado sobre las dos primeras componentes") +
+  theme_minimal()
+
+ggplot(pca_density, aes(x = PC1, y = PC2, color = OPTICS)) +
+  geom_point(alpha = 0.55, size = 1.2) +
+  labs(title = "OPTICS proyectado sobre las dos primeras componentes") +
+  theme_minimal()
+```
+
+Si la mayor parte de las observaciones se concentra en un único grupo o se
+clasifica como ruido, la estructura del dataset no está bien representada por
+regiones de densidad separadas. En ese caso k-means, k-medians o PAM ofrecen
+una segmentación más estable e interpretable.
+
+# Modelos supervisados
+
+## Preparación de entrenamiento y test
+
+Se utiliza una división estratificada del 70% para entrenamiento y 30% para
+test. El muestreo estratificado mantiene la proporción de impagos en ambos
+conjuntos.
+
+```{r train-test}
+datos_modelo <- clientes |>
+  dplyr::select(-ID, -GEdad)
+
+set.seed(123)
+train_index <- caret::createDataPartition(
+  datos_modelo$Pago,
+  p = 0.70,
+  list = FALSE
+)
+
+train_data <- datos_modelo[train_index, ]
+test_data <- datos_modelo[-train_index, ]
+
+data.frame(
+  conjunto = c("Entrenamiento", "Test"),
+  observaciones = c(nrow(train_data), nrow(test_data)),
+  porcentaje_impago = round(
+    100 * c(
+      mean(train_data$Pago == "Impago"),
+      mean(test_data$Pago == "Impago")
+    ),
+    2
+  )
+)
+```
+
+## Árbol de decisión sin poda y podado
+
+```{r arbol-decision}
+set.seed(123)
+arbol_completo <- rpart::rpart(
+  Pago ~ .,
+  data = train_data,
+  method = "class",
+  control = rpart::rpart.control(
+    cp = 0,
+    minsplit = 50,
+    maxdepth = 12,
+    xval = 10
+  )
+)
+
+cp_optimo <- arbol_completo$cptable[
+  which.min(arbol_completo$cptable[, "xerror"]),
+  "CP"
+]
+
+arbol_podado <- prune(
+  arbol_completo,
+  cp = cp_optimo
+)
+
+cp_optimo
+```
+
+```{r graficos-arbol, fig.height=8}
+rpart.plot::rpart.plot(
+  arbol_completo,
+  type = 2,
+  extra = 104,
+  fallen.leaves = TRUE,
+  main = "Árbol sin poda"
+)
+
+rpart.plot::rpart.plot(
+  arbol_podado,
+  type = 2,
+  extra = 104,
+  fallen.leaves = TRUE,
+  main = "Árbol podado"
+)
+```
+
+```{r evaluar-arbol}
+pred_arbol_completo <- predict(
+  arbol_completo,
+  test_data,
+  type = "class"
+)
+
+pred_arbol_podado <- predict(
+  arbol_podado,
+  test_data,
+  type = "class"
+)
+
+cm_arbol_completo <- caret::confusionMatrix(
+  pred_arbol_completo,
+  test_data$Pago,
+  positive = "Impago"
+)
+
+cm_arbol_podado <- caret::confusionMatrix(
+  pred_arbol_podado,
+  test_data$Pago,
+  positive = "Impago"
+)
+
+cm_arbol_completo
+cm_arbol_podado
+```
+
+La poda reduce la complejidad y facilita la interpretación. La comparación no
+debe basarse únicamente en accuracy: sensibilidad, especificidad, balanced
+accuracy y Kappa permiten comprobar si el modelo identifica la clase de
+impago.
+
+## Random Forest con muestreo balanceado
+
+Random Forest permite capturar relaciones no lineales y combinaciones entre
+variables. Para evitar que cada árbol se concentre en la clase mayoritaria, se
+equilibra el bootstrap interno mediante `sampsize`.
+
+```{r random-forest}
+class_counts <- table(train_data$Pago)
+balanced_size <- min(class_counts)
+
+set.seed(123)
+rf_balanced <- randomForest::randomForest(
+  Pago ~ .,
+  data = train_data,
+  ntree = 300,
+  mtry = floor(sqrt(ncol(train_data) - 1)),
+  importance = TRUE,
+  sampsize = rep(balanced_size, length(class_counts))
+)
+
+rf_balanced
+```
+
+```{r evaluar-random-forest}
+pred_rf <- predict(
+  rf_balanced,
+  test_data,
+  type = "class"
+)
+
+cm_rf <- caret::confusionMatrix(
+  pred_rf,
+  test_data$Pago,
+  positive = "Impago"
+)
+
+cm_rf
+```
+
+```{r importancia-variables}
+randomForest::varImpPlot(
+  rf_balanced,
+  type = 2,
+  main = "Importancia de variables en Random Forest"
+)
+```
+
+## Comparación de modelos
+
+```{r tabla-comparacion-modelos}
+extract_metrics <- function(cm) {
+  c(
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Kappa = unname(cm$overall["Kappa"]),
+    Sensibilidad = unname(cm$byClass["Sensitivity"]),
+    Especificidad = unname(cm$byClass["Specificity"]),
+    Balanced_Accuracy = unname(cm$byClass["Balanced Accuracy"])
+  )
+}
+
+comparacion_modelos <- rbind(
+  "Árbol sin poda" = extract_metrics(cm_arbol_completo),
+  "Árbol podado" = extract_metrics(cm_arbol_podado),
+  "Random Forest balanceado" = extract_metrics(cm_rf)
+)
+
+knitr::kable(
+  round(comparacion_modelos, 3),
+  caption = "Rendimiento sobre el conjunto de test"
+)
+```
+
+El modelo preferido debe mantener un equilibrio razonable entre detección de
+impagos y clasificación de clientes sin impago. En un problema de riesgo
+crediticio, un falso negativo puede ser más costoso que un falso positivo, por
+lo que la sensibilidad de la clase `Impago` tiene especial relevancia.
+
+# Limitaciones y riesgos de uso
+
+El dataset presenta varias limitaciones que condicionan los resultados:
+
+- **Antigüedad y contexto**: los datos corresponden a Taiwán y a un periodo
+  concreto. El comportamiento financiero, la regulación y las condiciones
+  económicas pueden haber cambiado.
+- **Variables disponibles**: no se incluyen ingresos, estabilidad laboral,
+  patrimonio, tipo de contrato, movimientos recientes o información
+  macroeconómica.
+- **Desbalanceo**: la clase de impago es minoritaria. La accuracy por sí sola
+  puede ofrecer una imagen demasiado optimista.
+- **Correlación temporal**: deuda, retrasos y pagos mensuales contienen
+  información redundante. Esto afecta a la interpretación y justifica el uso
+  de PCA.
+- **Valores extremos**: los importes tienen una dispersión alta. Aunque muchos
+  son legítimos, influyen en algoritmos basados en medias y distancias.
+- **Riesgo de discriminación**: sexo, edad, educación y estado civil son
+  variables sensibles. Un uso real exigiría revisión legal, evaluación de
+  sesgos y mecanismos de explicación y reclamación.
+- **Cambio de distribución**: un modelo entrenado con datos históricos puede
+  degradarse si cambian los perfiles de cliente o las políticas de crédito.
+
+El resultado no debe utilizarse como una decisión automática de concesión. Su
+uso razonable sería como señal adicional dentro de un proceso revisado por
+especialistas, con monitorización periódica y validación sobre datos actuales.
+
+# Conclusiones
+
+El análisis muestra que el comportamiento financiero mensual contiene más
+información que las variables demográficas por separado. Las deudas y pagos
+están fuertemente correlacionados, y PCA permite resumir parte de esa
+redundancia.
+
+En la segmentación, la estandarización es imprescindible. K-means ofrece una
+separación sencilla de interpretar, mientras que k-medians y PAM aportan mayor
+robustez frente a importes extremos. DBSCAN y OPTICS dependen de forma intensa
+de sus parámetros y pueden no encontrar grupos diferenciados cuando las
+observaciones se solapan en alta dimensión.
+
+En la clasificación, el árbol podado facilita la explicación de las reglas y
+Random Forest aporta mayor flexibilidad. La comparación final debe priorizar
+la sensibilidad y la balanced accuracy, no solo el porcentaje global de
+aciertos.
+
+Como siguiente paso de un proyecto real sería necesario entrenar con
+información más reciente, ajustar costes distintos para falsos positivos y
+falsos negativos, estudiar calibración de probabilidades y evaluar equidad
+entre grupos antes de plantear una aplicación operativa.
+
+# Referencias
+
+- UCI Machine Learning Repository. *Default of Credit Card Clients*:
+  <https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients>
+- Yeh, I. C. y Lien, C. H. (2009). *The comparisons of data mining techniques
+  for the predictive accuracy of probability of default of credit card
+  clients*. Expert Systems with Applications, 36(2), 2473-2480.
+- Chapman, P. et al. (2000). *CRISP-DM 1.0: Step-by-step data mining guide*.
+
+# Información de la sesión
+
+```{r session-info}
+sessionInfo()
+```

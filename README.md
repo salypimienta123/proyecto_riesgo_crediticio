@@ -2,14 +2,8 @@
 
 ## Descripción
 
-Este proyecto analiza el riesgo de impago de clientes con tarjeta de crédito utilizando técnicas de minería de datos y aprendizaje automático.
-
-El trabajo combina dos enfoques:
-
-- Segmentación de clientes mediante técnicas de clustering.
-- Predicción del impago mediante modelos supervisados.
-
-El objetivo es identificar patrones de comportamiento financiero y construir modelos capaces de detectar clientes con mayor probabilidad de incumplimiento de pago.
+Proyecto realizado para la asignatura de Minería de Datos. 
+Se trata de un análisis de riesgo por impago en tarjetas de crédito de Taiwan.
 
 ## Dataset
 
@@ -71,10 +65,11 @@ Proyecto/
 ├── data/
 │   └── creditcard.xls
 │
-├── docs/
-│   └── Proyecto_Mineria_Datos_Riesgo_Crediticio.pdf
+├── Proyecto_Mineria_Datos_Riesgo_Crediticio.pdf
+│   
 │
-├── src/
-│   └── analisis.Rmd
+├── analisis.Rmd
+│
+├── Proyecto_Mineria_Datos_Riesgo_Crediticio.html
 │
 └── README.md

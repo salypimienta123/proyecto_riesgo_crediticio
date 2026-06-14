@@ -2,8 +2,9 @@
 
 ## Descripción
 
-Proyecto realizado para la asignatura de Minería de Datos. 
-Se trata de un análisis de riesgo por impago en tarjetas de crédito de Taiwan.
+Proyecto realizado para la asignatura de Minería de Datos y programado en R Studio.
+Se trata de un análisis de riesgo por impago en tarjetas de crédito de Taiwan.  
+
 
 ## Dataset
 
